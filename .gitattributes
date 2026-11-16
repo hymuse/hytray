@@ -1,0 +1,29 @@
+# 行尾统一：默认按文本处理，具体规则见下
+* text=auto
+
+# Markdown / 源码一律 LF（避免跨机行尾漂移）
+*.md   text eol=lf
+*.go   text eol=lf
+*.py   text eol=lf
+*.toml text eol=lf
+
+# Shell 脚本必须 LF —— 带 CRLF 会在 Git Bash 里报 "bad interpreter: /bin/sh^M"
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Windows 脚本用 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：不做行尾转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.xlsx binary
+*.docx binary
+*.pptx binary
