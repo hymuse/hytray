@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -24,6 +25,53 @@ func TestTrimTip(t *testing.T) {
 	}
 	if got := trimTip("  x  "); got != "x" {
 		t.Errorf("应裁剪首尾空白，得到 %q", got)
+	}
+}
+
+// uFlags 守卫：NIF_SHOWTIP（MSDN 权威值 0x80）必须在 uFlags 里。
+// V4 下标准 tooltip 靠它开启（MSDN 明定），不是靠退回 V0。
+//
+// 历史坑（两次）：
+//
+//	① 迁移到 V4 后只 copy 了 szTip、没带 NIF_SHOWTIP —— 悬停不弹；
+//	② 补 flag 时误写成 0x40，且守卫自证「nifShowTip==0x40」= 假绿，修了等于没修。
+//
+// 本测试用硬编码 0x80（MSDN NOTIFYICONDATAW.uFlags）钉住真值，不引用被测常量自证。
+// 反向验证：把 iconFlags 里的 nifShowTip 删掉、或把常量改回 0x40，本测试立刻 FAIL。
+func TestIconFlagsShowTip(t *testing.T) {
+	const msdnNifShowTip = 0x80 // 外部权威值，故意不引用 nifShowTip
+	flags := iconFlags()
+	if flags&msdnNifShowTip == 0 {
+		t.Errorf("uFlags 必须含 NIF_SHOWTIP(0x80)，当前 0x%x", flags)
+	}
+	if flags&nifTip == 0 {
+		t.Errorf("uFlags 必须含 NIF_TIP(0x4)，当前 0x%x", flags)
+	}
+	if nifShowTip != msdnNifShowTip {
+		t.Errorf("nifShowTip 应为 MSDN NIF_SHOWTIP=0x80，当前 0x%x", nifShowTip)
+	}
+}
+
+// 完整结构守卫：NOTIFYICONDATAW 必须是完整 Vista+ 布局（64 位 = 976）。
+//
+// 历史坑：原结构止于 dwInfoFlags（952），缺 guidItem(16)+hBalloonIcon(8)。
+// Win11 新 XAML 任务栏按 cbSize 判定结构版本，尺寸不足会忽略 NIF_SHOWTIP。
+// 硬编码 976（MSDN 完整 sizeof），反向验证：删掉任一尾部字段本测试立刻 FAIL。
+func TestNotifyIconDataFullSize(t *testing.T) {
+	const msdnFullSize = 976 // 64-bit NOTIFYICONDATAW
+	if got := unsafe.Sizeof(notifyIconData{}); got != msdnFullSize {
+		t.Errorf("sizeof(notifyIconData)=%d，MSDN 完整 NOTIFYICONDATAW 应为 %d", got, msdnFullSize)
+	}
+}
+
+// 默认语义守卫：Options 零值必须走 V4（V0Compat=false）。
+//
+// 目标 = 键盘选中 + 标准 tooltip 兼得，默认就得是 V4；V0Compat=true 只是逃生舱。
+// 反向验证：把 V0Compat 默认改成 true（即零值走 V0）本测试 FAIL。
+func TestV4ByDefault(t *testing.T) {
+	var opts Options
+	if opts.V0Compat {
+		t.Error("Options 零值 V0Compat 必须为 false（默认走 V4），当前为 true")
 	}
 }
 

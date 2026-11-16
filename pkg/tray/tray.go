@@ -99,6 +99,14 @@ type Options struct {
 	// Style 菜单渲染风格。零值 = StyleNative。
 	Style Style
 
+	// V0Compat 退回 V0 回调语义（放弃键盘选中，换老式tooltip行为）。
+	//
+	// 默认 false = V4（键盘选中 / 中键 + 标准 tooltip 兼得）。V4 下标准 tooltip
+	// 靠 NIF_SHOWTIP 开启（MSDN 明定），且 NOTIFYICONDATAW 必须是完整 976 字节、
+	// NIM_ADD 时 uVersion 就要写 4 —— 这三点都满足时 Win11 可兼顾。
+	// 只有目标系统上 V4+tooltip 仍不弹时，才设 true 退回 V0 作逃生舱。
+	V0Compat bool
+
 	// Theme 菜单明暗策略。零值 = ThemeAuto（跟随系统）。
 	// 注意：这是**进程级**设置（Win32 没有「只让这个菜单变深」的口子），
 	// 会让本进程的所有原生菜单/对话框都跟随 —— 托盘进程通常只有这一个菜单，无副作用。

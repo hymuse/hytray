@@ -44,6 +44,10 @@ const (
 	nifIcon    = 0x2
 	nifTip     = 0x4
 	nifInfo    = 0x10
+	// nifShowTip（NIF_SHOWTIP）：V4 语义下 shell 默认不弹标准 tooltip（留给应用自绘
+	// NIN_POPUPOPEN），必须显式带这条才显示——不设的话 tooltip 注册再对也不显示。
+	// 权威值 = MSDN NOTIFYICONDATAW.uFlags：NIF_SHOWTIP 0x00000080（不是 0x40）。
+	nifShowTip = 0x80
 
 	// NIIF_* 与 tray.go 里 BalloonKind 的枚举值一一对应（BalloonNone=0 … BalloonError=3）。
 	niifNone    = 0x0
@@ -58,6 +62,8 @@ const (
 	ninBalloonHide      = 0x0403
 	ninBalloonTimeout   = 0x0404
 	ninBalloonUserClick = 0x0405 // 用户点了气泡通知
+	ninPopupOpen        = 0x0406 // 鼠标悬停图标（V4 tooltip 诊断用）
+	ninPopupClose       = 0x0407
 
 	wmContextMenu = 0x007B // V4 下右键走这个，而不是 WM_RBUTTONUP
 	wmMButtonUp   = 0x0208
@@ -70,6 +76,9 @@ const (
 	// smCxSmIcon = SM_CXSMICON（系统小图标宽度；100% DPI 为 16，150% 为 24，200% 为 32）。
 	smCxSmIcon = 49
 )
+
+// iconFlags 是 NOTIFYICONDATA.uFlags 的唯一来源，抽成函数供守卫测试钉住。
+func iconFlags() uint32 { return nifMessage | nifIcon | nifTip | nifShowTip }
 
 var (
 	user32   = windows.NewLazySystemDLL("user32.dll")
@@ -134,11 +143,15 @@ type msgT struct {
 	lPrivate uint32
 }
 
-// notifyIconData 是 NOTIFYICONDATAW 的 **V2 布局**（到 dwInfoFlags 为止）。
+// notifyIconData 是 NOTIFYICONDATAW 的**完整 Vista+ 布局**（含 guidItem / hBalloonIcon）。
 //
 // V1（到 szTip，64 字符）只能显示 tooltip；要弹系统通知必须有 szInfo / szInfoTitle。
-// ★升级到 V2 时 szTip 也从 64 变 128 字符 —— 只加字段不扩 szTip 会整体错位，
-// Windows 会把 szInfoTitle 当 tooltip 读。cbSize 一律由 unsafe.Sizeof 给出（64 位 = 952）。
+// ★升级时 szTip 从 64 变 128 字符 —— 只加字段不扩 szTip 会整体错位，
+// Windows 会把 szInfoTitle 当 tooltip 读。cbSize 一律由 unsafe.Sizeof 给出。
+//
+// ★2026-11-16：原实现止于 dwInfoFlags（V3，64 位 = 952），缺尾部 guidItem(16) +
+// hBalloonIcon(8)。Win11 新任务栏按 cbSize 判定结构版本，尺寸不足会忽略依赖完整结构的
+// 标志（如 NIF_SHOWTIP）。补齐后 64 位 = 976，与微软 NOTIFYICONDATAW 完全一致。
 type notifyIconData struct {
 	cbSize           uint32
 	hWnd             windows.Handle
@@ -150,9 +163,11 @@ type notifyIconData struct {
 	dwState          uint32
 	dwStateMask      uint32
 	szInfo           [256]uint16
-	uVersion         uint32 // 与 uTimeout 共用；NIM_SETVERSION 时写 4
+	uVersion         uint32 // 与 uTimeout 共用；NIM_ADD / NIM_SETVERSION 时写 4
 	szInfoTitle      [64]uint16
 	dwInfoFlags      uint32
+	guidItem         [16]byte       // GUID（本包用 uID 标识，保留全 0；仅占位保证 cbSize 完整）
+	hBalloonIcon     windows.Handle // 自定义气球图标（保留 0 = 用默认）
 }
 
 // taskbarCreatedMsg explorer.exe 重启时广播的消息号（0 = 还没注册成功）。
@@ -177,15 +192,16 @@ var (
 )
 
 type state struct {
-	opts      Options
-	hwnd      windows.Handle
-	icon      windows.Handle
-	iconBytes []byte // 原始图标字节：换屏 / SetIcon 后要按新 DPI 重新选档
-	nid       notifyIconData
-	version   atomic.Uint32 // 回调语义版本：4 = V4（键盘可达），0 = 退回 V0
-	ready     atomic.Bool   // 图标是否已成功挂上（退避重试期间为 false）
-	alive     atomic.Bool   // 窗口是否还有效（收到 Quit / WM_DESTROY 后置 false）
-	style     atomic.Int32  // 菜单样式，运行时可切（SetStyle）
+	opts         Options
+	hwnd         windows.Handle
+	icon         windows.Handle
+	iconBytes    []byte // 原始图标字节：换屏 / SetIcon 后要按新 DPI 重新选档
+	nid          notifyIconData
+	version      atomic.Uint32 // 回调语义版本：4 = V4（键盘可达），0 = 退回 V0
+	ready        atomic.Bool   // 图标是否已成功挂上（退避重试期间为 false）
+	alive        atomic.Bool   // 窗口是否还有效（收到 Quit / WM_DESTROY 后置 false）
+	style        atomic.Int32  // 菜单样式，运行时可切（SetStyle）
+	lastPopupLog atomic.Uint64 // hover 诊断日志节流时间戳（UnixNano，0=从未记）
 }
 
 // notifyIconIdentifier 是 NOTIFYICONIDENTIFIER（Shell_NotifyIconGetRect 的入参）。
@@ -293,9 +309,15 @@ func run(opts Options) error {
 		cbSize:           uint32(unsafe.Sizeof(notifyIconData{})),
 		hWnd:             st.hwnd,
 		uID:              1,
-		uFlags:           nifMessage | nifIcon | nifTip,
+		uFlags:           iconFlags(),
 		uCallbackMessage: msgCallback,
 		hIcon:            st.icon,
+	}
+	// MSDN 示例：NIM_ADD 时 uVersion 就要写好（与 NIM_SETVERSION 一致），
+	// 让 shell 在注册那一刻就按 V4 解析。之前 ADD 时留 0、事后 SETVERSION 补 4，
+	// Win11 上可能导致 NIF_SHOWTIP 在注册阶段被按旧语义忽略。
+	if !opts.V0Compat {
+		st.nid.uVersion = notifyIconVersion4
 	}
 	copy(st.nid.szTip[:], syscall.StringToUTF16(trimTip(opts.Tooltip))) // 末尾自带 0
 	Logf("窗口就绪 hwnd=%#x；%s；HICON=%#x；style=%d", hwnd, iconSrc, icon, style)
@@ -351,16 +373,22 @@ func addIcon(st *state) bool {
 		return false
 	}
 
-	// V4：lParam 低 16 位是事件、高 16 位是图标 ID，且 NIN_KEYSELECT（键盘选中）才开始送达。
-	// 失败不致命 —— 退回 V0 语义照样能用鼠标，只是键盘用户点不开菜单。
-	nid := st.nid
-	nid.uVersion = notifyIconVersion4
-	if shellNotify(nimSetVersion, &nid) {
-		st.version.Store(notifyIconVersion4)
-		Logf("回调版本已切到 V4（键盘选中 / 中键 / 悬停事件可用）")
+	// 默认 V4：键盘选中 / 中键 + 标准 tooltip 兼得。NIM_ADD 时已写 uVersion=4
+	// （见上方初始化），这里再补一次 NIM_SETVERSION（MSDN 要求每次 ADD 都调）。
+	// 标准 tooltip 靠完整结构(976)+NIF_SHOWTIP 保证，不是靠退回 V0。
+	if !st.opts.V0Compat {
+		nid := st.nid
+		nid.uVersion = notifyIconVersion4
+		if shellNotify(nimSetVersion, &nid) {
+			st.version.Store(notifyIconVersion4)
+			Logf("回调版本已切到 V4（键盘选中 / 中键 + 标准 tooltip 兼得）")
+		} else {
+			st.version.Store(0)
+			Logf("NIM_SETVERSION 失败，保持 V0 语义")
+		}
 	} else {
 		st.version.Store(0)
-		Logf("NIM_SETVERSION 失败，保持 V0 语义 —— 键盘用户将无法打开菜单")
+		Logf("V0Compat：保持 V0 回调语义（逃生舱，无键盘选中）")
 	}
 
 	if !st.ready.Swap(true) {
@@ -461,6 +489,17 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 			// 用户点了气泡通知 —— 这是通知最有价值的用法（点「已在托盘」直接开管理台）。
 			if st.opts.OnBalloonClick != nil {
 				safeCall(st.opts.OnBalloonClick)
+			}
+		case ninPopupOpen:
+			// V4 tooltip 健康探针：NIF_SHOWTIP 生效时 shell 弹标准 tooltip、
+			// **不发** NIN_POPUPOPEN；它来了 = shell 把悬停当「应用自绘 UI」信号，
+			// 典型因 cbSize 非完整 976 或 NIM_ADD 时 uVersion 没写 4。
+			// 2026-11-16 实证：952 + ADD 时 uVersion=0 ⇒ 连发 POPUPOPEN、tooltip 不弹；
+			// 三处按 MSDN 对齐后 ⇒ tooltip 弹、POPUPOPEN 不再来。节流避免刷屏。
+			if st.lastPopupLog.Load() == 0 || time.Since(time.Unix(0, int64(st.lastPopupLog.Load()))) > 10*time.Second {
+				Logf("hover 命中托盘图标（NIN_POPUPOPEN），tooltip=%q uFlags=0x%x cbSize=%d",
+					trimTip(st.opts.Tooltip), st.nid.uFlags, st.nid.cbSize)
+				st.lastPopupLog.Store(uint64(time.Now().UnixNano()))
 			}
 		case wmMButtonUp:
 			Logf("中键点击（暂不暴露回调）")
