@@ -152,6 +152,36 @@ func TestTrayEventV4(t *testing.T) {
 	}
 }
 
+// 左键事件按版本分流守卫（2026-11-20 双标签根因）。
+//
+// 回归背景：旧实现把 NIN_SELECT / WM_LBUTTONUP / WM_LBUTTONDBLCLK 三个事件
+// 全部映射到 OnOpen。V4 下 Win11 同一次单击同时送达 NIN_SELECT + WM_LBUTTONUP，
+// 于是 openURL 被调两次 ⇒ 浏览器开两个相同标签（截图实锤 + tray.log 成对记录）。
+//
+// 正向规则：V4 只认 NIN_SELECT；V0 才认鼠标消息。两条路径互不串味。
+func TestEventOpensPanel(t *testing.T) {
+	cases := []struct {
+		name    string
+		version uint32
+		event   uint32
+		want    bool
+	}{
+		// V4：单击只有 NIN_SELECT 生效；补发的 WM_LBUTTONUP 必须被忽略。
+		{"V4 单击 NIN_SELECT → 开", notifyIconVersion4, ninSelect, true},
+		{"V4 补发 WM_LBUTTONUP → 忽略（双标签根因）", notifyIconVersion4, wmLButtonUp, false},
+		{"V4 遗留 WM_LBUTTONDBLCLK → 忽略", notifyIconVersion4, wmLButtonDblClk, false},
+		// V0：老式鼠标消息仍生效。
+		{"V0 左键 WM_LBUTTONUP → 开", 0, wmLButtonUp, true},
+		{"V0 双击 WM_LBUTTONDBLCLK → 开", 0, wmLButtonDblClk, true},
+		{"V0 不认 V4 的 NIN_SELECT", 0, ninSelect, false},
+	}
+	for _, c := range cases {
+		if got := eventOpensPanel(c.version, c.event); got != c.want {
+			t.Errorf("%s：得到 %v，要 %v", c.name, got, c.want)
+		}
+	}
+}
+
 // V4 的高 16 位（图标 ID）不得干扰事件判断 —— 多图标场景下 ID 会变大。
 func TestTrayEventIgnoresHighBits(t *testing.T) {
 	for _, iconID := range []uintptr{1, 7, 0xFFFF} {

@@ -452,6 +452,19 @@ func trayEvent(version uint32, lParam uintptr) uint32 {
 	return uint32(lParam)
 }
 
+// eventOpensPanel 判断某事件在给定回调版本下是否该触发 OnOpen（打开管理台）。
+//
+// ★ 2026-11-20 双标签根因：旧实现把 NIN_SELECT / WM_LBUTTONUP / WM_LBUTTONDBLCLK
+// 三个事件一视同仁都触发 OnOpen。V4 语义下单次左键只有 NIN_SELECT，Win11 实测
+// 同一次点击还会补发 WM_LBUTTONUP，旧映射于是当成第二次点击 ⇒ 开两个标签。
+// 收窄为「按版本认事件」后，同一击的两个事件只有对的那一个生效。
+func eventOpensPanel(version, event uint32) bool {
+	if version >= notifyIconVersion4 {
+		return event == ninSelect
+	}
+	return event == wmLButtonUp || event == wmLButtonDblClk
+}
+
 func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 	mu.Lock()
 	st := current
@@ -475,7 +488,14 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		event := trayEvent(st.version.Load(), lParam)
 		switch event {
 		case ninSelect, wmLButtonUp, wmLButtonDblClk:
-			// V4 下单击是 NIN_SELECT（不再发 WM_LBUTTONUP），双击仍是 WM_LBUTTONDBLCLK。
+			// 按版本分流：V4 只认 NIN_SELECT，V0 才认鼠标消息。同一次点击的
+			// 「NIN_SELECT + WM_LBUTTONUP」配对只触发一次（见 eventOpensPanel）。
+			ver := st.version.Load()
+			if !eventOpensPanel(ver, event) {
+				Logf("忽略重复左键事件：version=%d event=%#x（本版本只认 NIN_SELECT=%#x）", ver, event, ninSelect)
+				break
+			}
+			Logf("左键事件：version=%d event=%#x lParam=%#x", ver, event, lParam)
 			if st.opts.OnOpen != nil {
 				safeCall(st.opts.OnOpen)
 			}
