@@ -202,6 +202,41 @@ type state struct {
 	alive        atomic.Bool   // 窗口是否还有效（收到 Quit / WM_DESTROY 后置 false）
 	style        atomic.Int32  // 菜单样式，运行时可切（SetStyle）
 	lastPopupLog atomic.Uint64 // hover 诊断日志节流时间戳（UnixNano，0=从未记）
+	lastOpen     atomic.Int64  // 上次 OnOpen 触发时刻（UnixNano，0=从未）；双击去重，见 shouldFireOpen
+}
+
+// openDebounceWindow 双击去重窗口。
+//
+// ★ 契约 §「左键回调 = 图标左键单击 / 双击」要求**一次物理动作只回调一次**。
+// 但 Windows 通知协议下，一次物理双击会被 shell 拆成多个逻辑事件：
+//   - V4：两次独立的 NIN_SELECT(0x400)，中间夹一个 WM_LBUTTONDBLCLK(0x203)
+//   - V0：WM_LBUTTONUP + WM_LBUTTONDBLCLK + WM_LBUTTONUP
+//
+// eventOpensPanel 按**事件码**过滤只能挡住「同一次点击的补发消息」，挡不住
+// 第二击那个合法事件 ⇒ OnOpen 被调两次 ⇒ 消费者开两个标签（hymuse 2026-11-21 实测）。
+//
+// 根治：按**时间窗**去重 —— 窗口内的后续「打开」事件一律不触发 OnOpen。
+// 500ms 对齐 Windows 系统双击阈值（GetDoubleClickTime 默认 500）；两次独立
+// 单击的正常人节奏远大于 500ms，不会误伤。
+//
+// 放在库内核（而非各消费者应用层）：契约是库承诺的，所有消费者都该拿到正确语义；
+// 否则每个用 hytray 的项目都要自己写一遍节流，还容易漏。
+const openDebounceWindow = 500 * time.Millisecond
+
+// shouldFireOpen 是否该触发 OnOpen：事件码判定（eventOpensPanel）+ 时间窗去重。
+//
+// now/last 均为 UnixNano。纯函数，单测钉住「一次双击只回调一次 + 慢单击不被吞」。
+// 时钟回拨（now < last）时放行：正常双击不可能是负间隔，别让系统调时把图标点死。
+// window 由调用方传入（生产传 openDebounceWindow），便于单测反向自证「窗口=0 必放行」
+// 时调的是**同一个真身**，不靠复制实现。
+func shouldFireOpen(version, event uint32, now, last int64, window time.Duration) bool {
+	if !eventOpensPanel(version, event) {
+		return false
+	}
+	if last <= 0 || now < last {
+		return true
+	}
+	return now-last >= int64(window)
 }
 
 // notifyIconIdentifier 是 NOTIFYICONIDENTIFIER（Shell_NotifyIconGetRect 的入参）。
@@ -488,11 +523,25 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		event := trayEvent(st.version.Load(), lParam)
 		switch event {
 		case ninSelect, wmLButtonUp, wmLButtonDblClk:
-			// 按版本分流：V4 只认 NIN_SELECT，V0 才认鼠标消息。同一次点击的
-			// 「NIN_SELECT + WM_LBUTTONUP」配对只触发一次（见 eventOpensPanel）。
+			// 按版本分流 + 双击时间窗去重（见 shouldFireOpen）：
+			//   - eventOpensPanel 挡「同一次点击的补发消息」（V4 的 WM_LBUTTONUP 等）
+			//   - 时间窗挡「双击的第二击那个合法打开事件」（V4 的第二个 NIN_SELECT）
+			// 两层缺一不可：只按事件码过滤挡不住第二个合法 0x400（2026-11-21 实测）。
 			ver := st.version.Load()
-			if !eventOpensPanel(ver, event) {
-				Logf("忽略重复左键事件：version=%d event=%#x（本版本只认 NIN_SELECT=%#x）", ver, event, ninSelect)
+			now := time.Now().UnixNano()
+			last := st.lastOpen.Load()
+			if !shouldFireOpen(ver, event, now, last, openDebounceWindow) {
+				if eventOpensPanel(ver, event) {
+					Logf("双击第二击：距上次 %dms，节流丢弃（version=%d event=%#x）",
+						time.Duration(now-last).Milliseconds(), ver, event)
+				} else {
+					Logf("忽略重复左键事件：version=%d event=%#x（本版本只认 NIN_SELECT=%#x）", ver, event, ninSelect)
+				}
+				break
+			}
+			// CAS 更新时间戳：消息泵单线程，但 OnOpen 可能间接触发重入，
+			// 保证只有一个胜者继续触发回调，不会两个都通过检查后各调一次。
+			if !st.lastOpen.CompareAndSwap(last, now) {
 				break
 			}
 			Logf("左键事件：version=%d event=%#x lParam=%#x", ver, event, lParam)

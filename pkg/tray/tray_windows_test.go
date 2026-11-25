@@ -182,6 +182,57 @@ func TestEventOpensPanel(t *testing.T) {
 	}
 }
 
+// 双击只触发一次 OnOpen 守卫（2026-11-21 hymuse 实测「单击开一次，双击开两次」）。
+//
+// 两层过滤缺一不可：
+//   - eventOpensPanel：按事件码挡同一次点击的补发消息（原守卫，保留）
+//   - shouldFireOpen 的时间窗：挡双击第二击那个**合法**打开事件
+//
+// 反向验证：把 openDebounceWindow 改成 0，「双击 80ms / 300ms」两条立刻 FAIL。
+func TestShouldFireOpenDebounce(t *testing.T) {
+	const base int64 = 1_700_000_000_000_000_000
+	ms := func(n int64) int64 { return base + n*int64(time.Millisecond) }
+
+	cases := []struct {
+		name    string
+		version uint32
+		event   uint32
+		now     int64
+		last    int64
+		want    bool
+	}{
+		// V4：双击 = 两次独立 NIN_SELECT，第二击必须被时间窗挡掉
+		{"V4 首次点击", notifyIconVersion4, ninSelect, base, 0, true},
+		{"V4 双击第二击 80ms → 丢弃", notifyIconVersion4, ninSelect, ms(80), ms(0), false},
+		{"V4 双击第二击 300ms → 丢弃", notifyIconVersion4, ninSelect, ms(300), ms(0), false},
+		{"V4 间隔 499ms → 丢弃", notifyIconVersion4, ninSelect, ms(499), ms(0), false},
+		{"V4 边界 500ms → 放行", notifyIconVersion4, ninSelect, ms(500), ms(0), true},
+		{"V4 慢单击 1.2s → 放行", notifyIconVersion4, ninSelect, ms(1200), ms(0), true},
+		{"V4 补发 LBUTTONUP → 丢弃（原守卫不回退）", notifyIconVersion4, wmLButtonUp, ms(1200), ms(0), false},
+		{"V4 DBLCLK 标记 → 丢弃（原守卫不回退）", notifyIconVersion4, wmLButtonDblClk, ms(1200), ms(0), false},
+		// V0：双击 = LBUTTONUP + DBLCLK + LBUTTONUP，同样按时间窗去重
+		{"V0 首次左键 LBUTTONUP", 0, wmLButtonUp, base, 0, true},
+		{"V0 双击 LBUTTONUP 第二击 60ms → 丢弃", 0, wmLButtonUp, ms(60), ms(0), false},
+		{"V0 DBLCLK 与首击同窗口 → 丢弃", 0, wmLButtonDblClk, ms(70), ms(0), false},
+		{"V0 慢单击 1.2s → 放行", 0, wmLButtonUp, ms(1200), ms(0), true},
+		// 时钟回拨别把图标点死
+		{"时钟回拨 now<last → 放行", notifyIconVersion4, ninSelect, ms(0), ms(100), true},
+	}
+	for _, c := range cases {
+		if got := shouldFireOpen(c.version, c.event, c.now, c.last, openDebounceWindow); got != c.want {
+			t.Errorf("%s：version=%d event=%#x now=%d last=%d 得到 %v，要 %v",
+				c.name, c.version, c.event, c.now, c.last, got, c.want)
+		}
+	}
+
+	// 反向自证：窗口=0 时原本被挡的两条必须放行（调真身，不复制实现）
+	for _, c := range cases[1:3] {
+		if !shouldFireOpen(c.version, c.event, c.now, c.last, 0) {
+			t.Errorf("窗口=0 时 %s 应放行（说明该用例确实由时间窗挡住）", c.name)
+		}
+	}
+}
+
 // V4 的高 16 位（图标 ID）不得干扰事件判断 —— 多图标场景下 ID 会变大。
 func TestTrayEventIgnoresHighBits(t *testing.T) {
 	for _, iconID := range []uintptr{1, 7, 0xFFFF} {
